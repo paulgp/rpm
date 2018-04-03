@@ -1,0 +1,152 @@
+---
+title: "How to estimate RPM"
+author: "Paul Goldsmith-Pinkham"
+date: "March 30, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggthemes)
+library(broom)
+library(glmnet)
+library(stringr)
+```
+
+## Data exploration
+
+The data we'll be using ranges over many NBA seasons (2004-2005 season to 2016-2017 season). I'll first focus on the 2016-2017 season.
+
+```{r raw_data, cache=TRUE, results='hide', message=FALSE, warning=FALSE}
+
+data_path <- "~/Dropbox/Basketball/data/"
+gamedata <- read_csv(file.path(data_path,"2015-16/[10-20-2015]-[06-20-2016]-combined-stats.csv"),
+                     col_types = cols(date = col_date(format = "%Y-%m-%d"),
+                                      play_length= col_time(),
+                                      game_id = col_number()))
+```
+
+First thing I need to do to study RPM is to convert this data into stint level data. 
+I define a stint as the time that a set of players (5 away, 5 home) are on the court together between substitutions. 
+From that definition, I want to collect:
+
+1. the number of possessions for each team
+2. the elapsed amount of time
+3. the net scoring of each team
+4. and the players on the team.
+
+In the code, I construct a stint-level identifier between substitutions, and generate a measure of possesions. 
+I follow the definition of possessions as being anytime between a team giving the ball back to the other team (so if you shoot, miss, and get the offensive rebound, that doesn't count as a new possession. This seemed to be how things are defined, but that doesn't seem logical to me. ) I then calculate the amount of scoring by the home and away team, as well as the number of minutes and posession per stint. 
+```{r, cache=TRUE, cached=TRUE, dependson='raw_data'}
+per_stint <- gamedata %>%  arrange(game_id, period, desc(remaining_time)) %>% 
+                mutate(end_stint = type == "sub" | play_id == 0) %>% 
+                filter((lag(end_stint) == 0 & end_stint == 0) |
+                      (end_stint == 1 & lead(end_stint) == 0))  %>% 
+                mutate(new_possession = team != lag(team)) %>%
+                mutate(stint_id =cumsum(end_stint)) %>% 
+                select(stint_id, starts_with("a"), starts_with("h"), play_length, period, new_possession, 
+                      remaining_time, team, game_id, -assist, -away, -home, event_type)
+                      
+
+per_stint_stats <- per_stint %>%
+                    group_by(game_id, stint_id) %>% 
+                    summarize(net_home_score = last(home_score) - first(home_score), 
+                              net_away_score = last(away_score) - first(away_score),
+                              minutes_played = sum(play_length, na.rm=TRUE), 
+                              num_possessions = sum(new_possession, na.rm=TRUE))
+```
+
+When I do some spot checks of the data, I find one outlier:
+```{r scores, echo=FALSE, fig.align='center'}
+scores <- ggplot(data = per_stint_stats %>% mutate(no_error = net_away_score >= 0)) + 
+              geom_jitter(aes(x = minutes_played, y = net_away_score, color=no_error)) + theme_bw()
+plot(scores)
+```
+
+That one game appears to be a data screwup in the last row, assuming there was an overtime when there actually wasn't:
+```{r error_check}
+filter(per_stint_stats, net_away_score < 0)
+filter(per_stint, stint_id == 25884) %>% select(remaining_time, game_id, period, event_type, home_score, away_score)
+```
+
+For the sake of simplicity, I just drop that stint: 
+```{r}
+per_stint_stats <- filter(per_stint_stats, net_home_score >= 0)
+filter(per_stint_stats, net_away_score < 0)
+per_stint_stats <- per_stint %>%
+                    group_by(game_id, stint_id) %>% 
+                    summarize(net_home_score = last(home_score) - first(home_score), net_away_score = last(away_score) - first(away_score),
+                              minutes_played = sum(play_length, na.rm=TRUE), num_possessions = sum(new_possession, na.rm=TRUE)) %>%
+                    filter(net_home_score >= 0) %>% filter(num_possessions != 0)
+per_stint_stats <- per_stint %>% select(a1:a5, h1:h5, stint_id, game_id) %>% group_by(stint_id, game_id) %>% filter(row_number()==1) %>%
+                    gather(key = "player", value = "playername", -stint_id, -game_id)   %>% 
+                    group_by(stint_id, game_id) %>% 
+                    right_join(per_stint_stats)
+```
+
+```{r, fig.width=3, fig.height=3, fig.align='center', fig.show='hold'}
+scores1 <- ggplot(data = per_stint_stats) + 
+  geom_jitter(aes(x = minutes_played, y = net_away_score)) + theme_bw()
+scores2 <- ggplot(data = per_stint_stats) + 
+  geom_jitter(aes(x = minutes_played, y = net_home_score)) + theme_bw()
+plot(scores1)
+plot(scores2)
+```
+
+## Plus-Minus
+Now, with this data, I need to construct a matrix of player names, which has the net score per stint, the number of posessions, and then a column for every player in the league. It's a little ridiculous, but with this design matrix (with a negative stint value for the away players), and a negative 1 or positive 1, depending on the player being home or away, I can estimate the Player effects using ridge regression. I can then construct the matrix and run ridge regression. The trick with ridge regression is that you need to cross-validate a penalty parameter, so I do that, then pick the optimal lambda and use the coefficients from that. 
+
+```{r, cache=TRUE}
+stint_matrix <- per_stint_stats %>% ungroup() %>% 
+                  mutate(home = (-1 + 2*(str_detect(player, "h")))) %>% mutate(plus_minus = (net_home_score-net_away_score)/ num_possessions) %>%
+                  select(plus_minus, playername, stint_id, home)
+
+matrix <- stint_matrix %>% mutate(i = row_number()) %>% group_by(stint_id) %>% spread(key = playername, value=home, fill=0)
+x <- matrix %>% ungroup() %>% select(-plus_minus, -stint_id, -i) %>% data.matrix()
+y <- matrix %>% ungroup() %>% select(plus_minus) %>% data.matrix()
+weights <- per_stint_stats %>% ungroup() %>% select(num_possessions) %>% data.matrix()
+lambdas <- 10^seq(3, -2, by = -.1)
+
+cv_fit <- cv.glmnet(x, y, alpha = 0, lambda = lambdas, weight=weights)
+opt_lambda <- cv_fit$lambda.min
+fit <- cv_fit$glmnet.fit
+glm_betas <- tidy(fit) %>%
+  filter(term != "(Intercept)", lambda == opt_lambda) %>%
+    select(player = term, coef = estimate) %>% mutate(APM = coef*100) %>%
+  arrange(APM)
+```
+
+This gives a measure of why I called APMs -- Adjusted Plus Minus -- which are regularized. So, how good are these? I can spot check the top, i.e. "sniff test":
+```{r}
+glm_betas %>% arrange(desc(APM)) %>% filter(row_number() < 25)
+```
+
+So some of these make sense -- Steph Curry, Tim Duncan (remember, this is 2015-2016), Draymond Green... but who the fork is Jarnell Stokes? Well, he's a dude who played two games. Perhaps unsurprisingly, Keith Appling also played 1 game (it's actually kind of sad, he was in jail for a year after this). So perhaps an easy check is to limit it to those players who ESPN thinks are real players. I merge my values to ESPN's RPM values for 2015-16:
+```{r}
+espn_rpm_2015 <- read_csv("~/repos/rpm/espn_rpm_2015.csv")
+espn_rpm <- espn_rpm_2015 %>% separate(NAME, c("player", "pos"), sep=",") %>% 
+            left_join(glm_betas) %>%
+            arrange(desc(APM))
+cor(espn_rpm %>% filter(GP > 0) %>% select(RPM, APM), use="na.or.complete")
+cor(espn_rpm %>% filter(GP > 40) %>% select(RPM, APM), use="na.or.complete")
+```
+With players with 40+ games, the correlation between RPM and APM is pretty good -- around 66 percent! What's it look like plotted?
+
+```{r, echo=FALSE, fig.align='center'}
+rpmapm <- ggplot(data=espn_rpm) + geom_point(aes(y = APM, x = RPM))
+plot(rpmapm)
+```
+If we focus on players with 40+ games?
+```{r, echo=FALSE, fig.align='center'}
+rpmapm <- ggplot(data=espn_rpm %>% filter(GP > 40), aes(y = APM, x = RPM)) + geom_point() + theme_bw()
+plot(rpmapm)
+```
+The new top 25 list:
+```{r}
+top25 <- espn_rpm%>% filter(GP > 40, MPG > 10) %>% arrange(desc(APM)) %>% filter(row_number() < 25) %>% select(RK, player, pos, GP, MPG, TEAM, APM, RPM, DRPM, ORPM, WINS  )
+knitr::kable(
+  top25, 
+  caption = "Top 25, APM method (with ESPN Rank + RPM)"
+)
+```
